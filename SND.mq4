@@ -1,163 +1,435 @@
 //+------------------------------------------------------------------+
-//|                                                      SND_Bot.mq5 |
-//|                        Supply and Demand Trading Bot             |
+//| Supply and Demand Trading Bot (MQL5 Version)                    |
+//| Author: Monte                                                   |
 //+------------------------------------------------------------------+
-input double LotSize = 0.1;          // Lot size for trading
-input int StopLossPips = 30;         // Stop loss in pips
-input int TakeProfitPips = 90;       // Take profit in pips (1:3 risk-reward)
-input double RiskPercentage = 1.0;   // Risk percentage per trade
-input int FakeoutThreshold = 10;     // Pips above/below level to detect fakeout
+#include <Trade\Trade.mqh>  // Include trade functions
+
+enum TradeType
+{
+   NONE = 0,
+   BUY_TRADE = 1,
+   SELL_TRADE = 2
+};
+
+//––– Supply/Demand Zone structure and storage
+struct Zone {
+   double high;
+   double low;
+   datetime time;
+};
+
+// Arrays to hold the last N zones
+#define MAX_ZONES 10
+Zone demandZones[MAX_ZONES];
+Zone supplyZones[MAX_ZONES];
+int demandZoneCount = 0;
+int supplyZoneCount = 0;
 
 //+------------------------------------------------------------------+
-//| Expert initialization function                                   |
+//| Returns true if there is already an open position on this symbol|
+//+------------------------------------------------------------------+
+bool HasOpenPositionForSymbol()
+{
+  for(int i = 0; i < PositionsTotal(); i++)
+  {
+    if(PositionGetSymbol(i) == _Symbol)
+      return true;
+  }
+  return false;
+}
+
+//+------------------------------------------------------------------+
+//| Inputs                                                           |
+//+------------------------------------------------------------------+
+input double LotSize = 0.1;             // Default lot size
+input int StopLossPips = 30;            // Stop Loss in pips
+input int TakeProfitPips = 400;         // Take Profit in pips
+input double RiskPercentage = 1.0;      // Risk per trade as % of balance
+input int FakeoutThreshold = 10;        // Minimum price movement to avoid fakeouts
+
+CTrade trade;                           // Trade object
+datetime lastTradeTime = 0;             // Last trade execution time
+
+//+------------------------------------------------------------------+
+//| Initialization                                                   |
 //+------------------------------------------------------------------+
 int OnInit()
-  {
-   // Initialization code
-   return(INIT_SUCCEEDED);
-  }
+{
+   return(INIT_SUCCEEDED); // Successful initialization
+}
+
+void OnDeinit(const int reason) {}      // No deinitialization logic needed
+
 //+------------------------------------------------------------------+
-//| Expert deinitialization function                                 |
-//+------------------------------------------------------------------+
-void OnDeinit(const int reason)
-  {
-   // Deinitialization code
-  }
-//+------------------------------------------------------------------+
-//| Expert tick function                                             |
+//| Main trading loop                                                |
 //+------------------------------------------------------------------+
 void OnTick()
-  {
-   // Check for open positions
-   if (PositionsTotal() > 0) return;
+{
+   // 1) History guard
+   if (Bars(_Symbol, PERIOD_H1) < 3)
+   {
+      Print(__FUNCTION__, ": waiting for H1 history (", Bars(_Symbol, PERIOD_H1), " bars)");
+      return;
+   }
+   ResetLastError();
 
-   // Get current price levels
+   // 2) Cooldown guard
+   if (!CanTrade())
+   {
+      Print(__FUNCTION__, ": cooldown in effect, next trade after ",
+            TimeToString(lastTradeTime + 5*60, TIME_MINUTES));
+      return;
+   }
+
+   // 3) Existing position guard
+   if(HasOpenPositionForSymbol())
+   {
+      Print("🛑 A position is already open on ", _Symbol);
+      return;
+   }
+
+   // 4) Tradability guard
+   if (!IsSymbolTradable())
+   {
+      Print(__FUNCTION__, ": symbol not tradable");
+      return;
+   }
+
    double currentPrice = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   double resistanceLevel = GetResistanceLevel();  // Function to calculate resistance level
-   double supportLevel = GetSupportLevel();       // Function to calculate support level
+   double resistanceLevel = GetResistanceLevel();
+   double supportLevel = GetSupportLevel();
 
-   // Detect fakeout for sell
+   // Check for price breaking above resistance (fakeout logic)
    if (currentPrice > resistanceLevel + FakeoutThreshold * _Point)
-     {
-      // Price has broken resistance, wait for reversal
-      if (currentPrice < resistanceLevel)
-        {
-         // Enter sell trade
-         EnterSellTrade(resistanceLevel);
-        }
-     }
+   {
+      EnterSellTrade(currentPrice);
+      SetTradeTime();
+   }
+   // Check for price breaking below support (fakeout logic)
+   else if (currentPrice < supportLevel - FakeoutThreshold * _Point)
+   {
+      EnterBuyTrade(currentPrice);
+      SetTradeTime();
+   }
+   
+   PurgeOldZones(48);
+   
+   ScanForSupplyDemandZones();   // identify fresh zones
+   CheckZoneEntry();             // trigger entries when price returns
+   
+   ResetLastTradeIfNoOpenPositions();
+}
 
-   // Detect fakeout for buy
-   if (currentPrice < supportLevel - FakeoutThreshold * _Point)
-     {
-      // Price has broken support, wait for reversal
-      if (currentPrice > supportLevel)
-        {
-         // Enter buy trade
-         EnterBuyTrade(supportLevel);
-        }
-     }
-
-   // Check for Supply/Demand zones
-   CheckSupplyDemandZones();
-  }
 //+------------------------------------------------------------------+
-//| Function to enter sell trade                                     |
+//| Global Symbol-Based Last Trade Tracker Trade Duplication Control |
+//+------------------------------------------------------------------+
+string GetLastTradeKey()
+{
+   return "LastTrade_" + _Symbol;
+}
+
+TradeType GetLastTrade()
+{
+   if (!GlobalVariableCheck(GetLastTradeKey()))
+      return NONE;
+   return (TradeType)(int)GlobalVariableGet(GetLastTradeKey());
+}
+
+void SetLastTrade(TradeType type)
+{
+   GlobalVariableSet(GetLastTradeKey(), type);
+}
+
+void ResetLastTradeIfNoOpenPositions()
+{
+   for (int i = 0; i < PositionsTotal(); i++)
+   {
+      if (PositionGetSymbol(i) == _Symbol)
+         return;
+   }
+   GlobalVariableDel(GetLastTradeKey());
+}
+
+//+------------------------------------------------------------------+
+//| Enter sell trade                                                 |
 //+------------------------------------------------------------------+
 void EnterSellTrade(double entryPrice)
-  {
+{
+   if (GetLastTrade() == SELL_TRADE) {
+      Print("🛑 Duplicate SELL trade avoided on ", _Symbol);
+      return;
+   }
+
    double sl = entryPrice + StopLossPips * _Point;
    double tp = entryPrice - TakeProfitPips * _Point;
-   trade.Sell(LotSize, _Symbol, entryPrice, sl, tp, "Sell Trade");
-  }
+   double lot = CalculateLotSize(StopLossPips);
+   CorrectTradeParameters(lot, entryPrice, sl, tp);
+
+   if (!trade.Sell(lot, _Symbol, entryPrice, sl, tp, "Sell Trade"))
+   {
+      Print("❌ Sell failed. Error: ", GetLastError());
+      ResetLastError();
+   }
+   else
+   {
+      SendNotification("✅ Sell trade executed on " + _Symbol);
+      SetLastTrade(SELL_TRADE);
+   }
+}
+
 //+------------------------------------------------------------------+
-//| Function to enter buy trade                                      |
+//| Enter buy trade                                                  |
 //+------------------------------------------------------------------+
 void EnterBuyTrade(double entryPrice)
-  {
+{
+   if (GetLastTrade() == BUY_TRADE) {
+   Print("🛑 Duplicate BUY trade avoided on ", _Symbol);
+   return;
+   }
+
    double sl = entryPrice - StopLossPips * _Point;
    double tp = entryPrice + TakeProfitPips * _Point;
-   trade.Buy(LotSize, _Symbol, entryPrice, sl, tp, "Buy Trade");
-  }
+   double lot = CalculateLotSize(StopLossPips);
+   CorrectTradeParameters(lot, entryPrice, sl, tp);
+
+   if (!trade.Buy(lot, _Symbol, entryPrice, sl, tp, "Buy Trade"))
+   {
+      Print("❌ Buy failed. Error: ", GetLastError());
+      ResetLastError();
+   }
+   else
+   {
+      SendNotification("✅ Buy trade executed on " + _Symbol);
+      SetLastTrade(BUY_TRADE);
+   }
+}
+
 //+------------------------------------------------------------------+
-//| Function to calculate resistance level                           |
+//| Lot size calculator based on account balance and SL              |
 //+------------------------------------------------------------------+
-double GetResistanceLevel()
-  {
-   // Logic to calculate resistance level (e.g., recent high, pivot point, etc.)
-   return iHigh(_Symbol, PERIOD_H1, 1);  // Example: Use the previous candle's high
-  }
+double CalculateLotSize(double slPips)
+{
+   double riskAmount = AccountInfoDouble(ACCOUNT_BALANCE) * RiskPercentage / 100.0;
+   double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double lot = NormalizeDouble(riskAmount / (slPips * tickValue), 2);
+
+   // Ensure lot within broker min/max range
+   double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+
+   lot = MathMax(minLot, lot);
+   lot = MathMin(maxLot, lot);
+   lot = MathFloor(lot / lotStep) * lotStep;
+
+   return lot;
+}
+
 //+------------------------------------------------------------------+
-//| Function to calculate support level                              |
+//| Adjust SL/TP to meet broker stop-level and price precision       |
 //+------------------------------------------------------------------+
-double GetSupportLevel()
-  {
-   // Logic to calculate support level (e.g., recent low, pivot point, etc.)
-   return iLow(_Symbol, PERIOD_H1, 1);  // Example: Use the previous candle's low
-  }
+void CorrectTradeParameters(double &lot, double &price, double &sl, double &tp)
+{
+   double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   if (lot < minLot) lot = minLot;
+
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double minStop = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * _Point;
+
+   price = NormalizeDouble(price, _Digits);
+
+   if (MathAbs(price - sl) < minStop)
+      sl = (price > sl) ? price - minStop : price + minStop;
+
+   if (MathAbs(price - tp) < minStop)
+      tp = (price > tp) ? price - minStop : price + minStop;
+
+   if (price <= 0)
+      price = (lot > 0) ? (bid + ask) / 2 : ask;
+}
+
 //+------------------------------------------------------------------+
-//| Function to check Supply/Demand zones                            |
+//| Utility Checks                                                   |
+//+------------------------------------------------------------------+
+bool IsSymbolTradable()  { return SymbolInfoInteger(_Symbol, SYMBOL_TRADE_MODE) != SYMBOL_TRADE_MODE_DISABLED; }
+
+bool CanTrade() { return (TimeCurrent() - lastTradeTime) > 5 * 60; }
+
+void SetTradeTime() { lastTradeTime = TimeCurrent(); }
+
+//+------------------------------------------------------------------+
+//| Price Action Confirmations for Supply/Demand Zones               |
 //+------------------------------------------------------------------+
 void CheckSupplyDemandZones()
-  {
-   // Logic to identify Supply/Demand zones using candlestick patterns
-   // Example: Look for Bullish/Bearish Engulfing patterns
-   if (IsBearishEngulfing())
-     {
-      // Identify Supply Zone
-      double supplyZoneHigh = iHigh(_Symbol, PERIOD_H1, 1);
-      double supplyZoneLow = iLow(_Symbol, PERIOD_H1, 1);
-      // Enter sell trade if price returns to the zone
-      if (SymbolInfoDouble(_Symbol, SYMBOL_BID) >= supplyZoneLow && SymbolInfoDouble(_Symbol, SYMBOL_BID) <= supplyZoneHigh)
-        {
-         EnterSellTrade(supplyZoneHigh);
-        }
-     }
+{
+   double price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double high = iHigh(_Symbol, PERIOD_H1, 1);
+   double low = iLow(_Symbol, PERIOD_H1, 1);
 
-   if (IsBullishEngulfing())
-     {
-      // Identify Demand Zone
-      double demandZoneHigh = iHigh(_Symbol, PERIOD_H1, 1);
-      double demandZoneLow = iLow(_Symbol, PERIOD_H1, 1);
-      // Enter buy trade if price returns to the zone
-      if (SymbolInfoDouble(_Symbol, SYMBOL_BID) >= demandZoneLow && SymbolInfoDouble(_Symbol, SYMBOL_BID) <= demandZoneHigh)
-        {
-         EnterBuyTrade(demandZoneLow);
-        }
-     }
-  }
+   if (IsBearishEngulfing() && price >= low && price <= high)
+   {
+      EnterSellTrade(price);
+      SetTradeTime();
+   }
+
+   if (IsBullishEngulfing() && price >= low && price <= high)
+   {
+      EnterBuyTrade(price);
+      SetTradeTime();
+   }
+}
+
 //+------------------------------------------------------------------+
-//| Function to detect Bearish Engulfing pattern                     |
+//| Candlestick pattern detection                                    |
 //+------------------------------------------------------------------+
 bool IsBearishEngulfing()
-  {
-   // Logic to detect Bearish Engulfing pattern
-   double open1 = iOpen(_Symbol, PERIOD_H1, 1);
-   double close1 = iClose(_Symbol, PERIOD_H1, 1);
-   double open2 = iOpen(_Symbol, PERIOD_H1, 2);
-   double close2 = iClose(_Symbol, PERIOD_H1, 2);
+{
+   double o1 = iOpen(_Symbol, PERIOD_H1, 1);
+   double c1 = iClose(_Symbol, PERIOD_H1, 1);
+   double o2 = iOpen(_Symbol, PERIOD_H1, 2);
+   double c2 = iClose(_Symbol, PERIOD_H1, 2);
+   return (c1 < o1 && c2 > o2 && c1 < o2 && o1 > c2);
+}
 
-   if (close1 < open1 && close2 > open2 && close1 < open2 && open1 > close2)
-     {
-      return true;
-     }
-   return false;
-  }
-//+------------------------------------------------------------------+
-//| Function to detect Bullish Engulfing pattern                     |
-//+------------------------------------------------------------------+
 bool IsBullishEngulfing()
-  {
-   // Logic to detect Bullish Engulfing pattern
-   double open1 = iOpen(_Symbol, PERIOD_H1, 1);
-   double close1 = iClose(_Symbol, PERIOD_H1, 1);
-   double open2 = iOpen(_Symbol, PERIOD_H1, 2);
-   double close2 = iClose(_Symbol, PERIOD_H1, 2);
+{
+   double o1 = iOpen(_Symbol, PERIOD_H1, 1);
+   double c1 = iClose(_Symbol, PERIOD_H1, 1);
+   double o2 = iOpen(_Symbol, PERIOD_H1, 2);
+   double c2 = iClose(_Symbol, PERIOD_H1, 2);
+   return (c1 > o1 && c2 < o2 && c1 > o2 && o1 < c2);
+}
 
-   if (close1 > open1 && close2 < open2 && close1 > open2 && open1 < close2)
-     {
-      return true;
-     }
-   return false;
-  }
 //+------------------------------------------------------------------+
+//| Support and Resistance levels (simplified)                       |
+//+------------------------------------------------------------------+
+double GetResistanceLevel() { return iHigh(_Symbol, PERIOD_H1, 1); }
+double GetSupportLevel()    { return iLow(_Symbol, PERIOD_H1, 1); }
+//+------------------------------------------------------------------+
+
+void LogToFile(string type, double lot, double price, double sl, double tp, string comment)
+{
+   string logFile = "Logs.csv";
+   int fileHandle = FileOpen(logFile, FILE_CSV | FILE_READ | FILE_WRITE | FILE_ANSI);
+
+   if (fileHandle != INVALID_HANDLE)
+   {
+      FileSeek(fileHandle, 0, SEEK_END); // Append to end
+      string log = TimeToString(TimeCurrent(), TIME_DATE | TIME_MINUTES) + "," +
+                   _Symbol + "," +
+                   type + "," +
+                   DoubleToString(lot, 2) + "," +
+                   DoubleToString(price, _Digits) + "," +
+                   DoubleToString(sl, _Digits) + "," +
+                   DoubleToString(tp, _Digits) + "," +
+                   comment;
+      FileWrite(fileHandle, log);
+      FileClose(fileHandle);
+   }
+   else
+   {
+      Print("❌ Failed to open local log file.");
+   }
+}
+
+void ScanForSupplyDemandZones()
+{
+   const int lookback = 50;               // how many H1 bars to inspect
+   for(int i = 3; i < lookback; i++)      // skip the 2 most recent bars
+   {
+      double high = iHigh(_Symbol, PERIOD_H1, i);
+      double low  = iLow (_Symbol, PERIOD_H1, i);
+      double body = MathAbs(iClose(_Symbol, PERIOD_H1, i) - iOpen(_Symbol, PERIOD_H1, i));
+      double range = high - low;
+      // **Supply**: strong bearish candle after bullish
+      if(iClose(_Symbol, PERIOD_H1, i+1) > iOpen(_Symbol, PERIOD_H1, i+1) &&
+         iClose(_Symbol, PERIOD_H1, i)   < iOpen(_Symbol, PERIOD_H1, i)   &&
+         body / range > 0.5)
+         AddSupplyZone(high, low, iTime(_Symbol, PERIOD_H1, i));
+      // **Demand**: strong bullish candle after bearish
+      if(iClose(_Symbol, PERIOD_H1, i+1) < iOpen(_Symbol, PERIOD_H1, i+1) &&
+         iClose(_Symbol, PERIOD_H1, i)   > iOpen(_Symbol, PERIOD_H1, i)   &&
+         body / range > 0.5)
+         AddDemandZone(high, low, iTime(_Symbol, PERIOD_H1, i));
+   }
+}
+
+void AddSupplyZone(double high, double low, datetime t)
+{
+   if(supplyZoneCount < MAX_ZONES)
+   {
+      // assign fields one by one
+      supplyZones[supplyZoneCount].high = high;
+      supplyZones[supplyZoneCount].low  = low;
+      supplyZones[supplyZoneCount].time = t;
+      supplyZoneCount++;
+   }
+}
+
+void AddDemandZone(double high, double low, datetime t)
+{
+   if(demandZoneCount < MAX_ZONES)
+   {
+      demandZones[demandZoneCount].high = high;
+      demandZones[demandZoneCount].low  = low;
+      demandZones[demandZoneCount].time = t;
+      demandZoneCount++;
+   }
+}
+
+
+void CheckZoneEntry()
+{
+   double price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+   // Demand zones → buy on bullish confirmation
+   for(int i = 0; i < demandZoneCount; i++)
+   {
+      if(price >= demandZones[i].low && price <= demandZones[i].high 
+         && IsBullishEngulfing())
+      {
+         EnterBuyTrade(price);
+         SetTradeTime();
+         return;
+      }
+   }
+
+   // Supply zones → sell on bearish confirmation
+   for(int i = 0; i < supplyZoneCount; i++)
+   {
+      if(price <= supplyZones[i].high && price >= supplyZones[i].low 
+         && IsBearishEngulfing())
+      {
+         EnterSellTrade(price);
+         SetTradeTime();
+         return;
+      }
+   }
+}
+
+void PurgeOldZones(int maxAgeHours)
+{
+   datetime now = TimeCurrent();
+   //––– Purge old demand zones
+   int writeDemand = 0;
+   for(int i = 0; i < demandZoneCount; i++)
+   {
+      if(now - demandZones[i].time <= (datetime)maxAgeHours * 3600)
+      {
+         demandZones[writeDemand++] = demandZones[i];
+      }
+   }
+   demandZoneCount = writeDemand;
+
+   //––– Purge old supply zones
+   int writeSupply = 0;
+   for(int j = 0; j < supplyZoneCount; j++)
+   {
+      if(now - supplyZones[j].time <= (datetime)maxAgeHours * 3600)
+      {
+         supplyZones[writeSupply++] = supplyZones[j];
+      }
+   }
+   supplyZoneCount = writeSupply;
+}
